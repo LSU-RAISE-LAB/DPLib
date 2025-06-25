@@ -1,0 +1,12 @@
+The multi-regional partitioning process has been verified to include all buses without omission.
+
+The best clustering configuration consists of 18 regions and 197 inter-regional tie-lines, identified within 10 iterations.
+The reference bus 4231 in the MATPOWER case has been assigned to Region 17 (mpc_regionR17).
+
+The graph topology was verified to be fully connected.
+The total number of branches across all regions, including inter-regional tie-lines, matches the number of branches in the MATPOWER case, which is 16049.
+The total number of buses across all regions matches the number of buses in the MATPOWER case, which is 9241.
+The total number of generators across all regions matches the number of generators in the MATPOWER case, which is 1445.
+
+The region-level topology figure has been saved as pglib_opf_case9241_pegase_18regions_topology.png
+The partitioned data has been saved as .mat and .m files named pglib_opf_case9241_pegase_18regions in the current path.
