@@ -161,7 +161,7 @@ Citation
 --------
 If you use this code in your work, please cite the following:
 
-M. Hasanzadeh, "Toward a Standard Repository for Distributed Power System Optimization and Control," 2025.
+M. Hasanzadeh and A. Kargarian, "DPLib: A Standard Benchmark Library for Distributed Power System Analysis and Optimization," http://arxiv.org/abs/2506.20819
 
 ======================================================================
 
