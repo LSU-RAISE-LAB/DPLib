@@ -76,7 +76,7 @@ Each tool includes a standalone README inside its folder:
 
 If you use this framework or its solvers in your research, please cite:
 
-> M. Hasanzadeh, "Toward a Standard Repository for Distributed Power System Optimization and Control," 2025.
+> M. Hasanzadeh and A. Kargarian, "DPLib: A Standard Benchmark Library for Distributed Power System Analysis and Optimization," http://arxiv.org/abs/2506.20819
 
 ---
 
