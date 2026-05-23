@@ -1,0 +1,1426 @@
+function result = partitioning_code(case_input, num_regions_input, use_weighted, bus_region_map)
+
+% =========================================================================
+% Title       : Graph-Based Power System Partitioning with Spectral Clustering
+% Author      : Milad Hasanzadeh
+% Email       : e.mhasanzadeh1377@yahoo.com
+% Affiliation : Department of Electrical and Computer Engineering,
+%               Louisiana State University, Baton Rouge, LA, USA
+% Date        : May 29, 2025
+%
+% Description :
+% This MATLAB script partitions a power system network into multiple 
+% electrically coherent regions using graph-theoretic techniques.
+% It leverages spectral clustering combined with k-means to provide a 
+% balanced and meaningful decomposition of MATPOWER case files, enabling 
+% distributed optimization and control across regional sub-networks.
+%
+% Functional Overview :
+% - Constructs the weighted graph Laplacian from the admittance matrix of the system.
+% - Computes eigenvectors of the Laplacian for spectral embedding.
+% - Applies k-means clustering to group buses into user-specified regions.
+% - Renumbers buses locally and ensures consistency within each partition.
+% - Identifies inter-regional tie-lines and separates them from intra-regional data.
+% - Saves the partitioned system as a structured .mat file and as .m files,
+%   compatible with distributed DC and AC OPF solvers.
+%
+% Key Features :
+% - Scalable spectral partitioning for large-scale power networks.
+% - Clear separation of internal and boundary (tie-line) components.
+% - Compatible with distributed ADMM-based DCOPF and ACOPF solvers.
+% - Automatic creation of region-specific data structures and variables.
+% - Option to export results in both `.mat` and `.m` formats for reproducibility.
+%
+% Requirements :
+% - MATLAB R2020a or newer.
+% - MATPOWER toolbox installed and added to the MATLAB path.
+% 
+%
+% License :
+% This script is provided for academic and research use only.
+% Redistribution or commercial use is not permitted without prior written consent.
+% If used in published work, proper acknowledgment is required.
+%
+% Copyright (c) 2025, Milad Hasanzadeh
+% =========================================================================
+
+
+clc; close all
+%% Handle user-defined / exogenous partition option
+if nargin < 4 || isempty(bus_region_map)
+    use_user_partition = false;
+else
+    use_user_partition = true;
+
+    if ~isnumeric(bus_region_map) || size(bus_region_map,2) ~= 2
+        error('bus_region_map must be a two-column numeric matrix: [bus_number, region_number].');
+    end
+end
+
+%% Prompt user to input a valid MATPOWER case 
+
+if nargin < 1 || isempty(case_input)
+    while true
+        sound(sin(2*pi*440*(0:1/8000:0.5)), 8000);
+        case_input = input('Enter MATPOWER case name (e.g., case10) or type "exit" to stop: ', 's');
+
+        if strcmpi(case_input, 'exit')
+            error('User exited. No valid case file was provided.');
+        end
+
+        if exist([case_input '.m'], 'file') == 2
+            break; 
+        else
+            fprintf('Error: The case "%s" does not exist in the MATLAB path or MATPOWER is not installed properly.\n', case_input);
+        end
+    end
+else
+    % If case_input is given as function argument, just verify it exists
+    if exist([case_input '.m'], 'file') ~= 2
+        error('The case "%s" does not exist in the MATLAB path or MATPOWER is not installed properly.', case_input);
+    end
+end
+
+
+%% Get user-defined number of regions for partitioning
+% In automatic mode, the number of regions is required.
+% In user-defined mode, it can be inferred from bus_region_map.
+
+if nargin < 2 || isempty(num_regions_input)
+
+    if use_user_partition
+        num_regions_input = length(unique(bus_region_map(:,2)));
+    else
+        while true
+            num_regions_input = input('Enter number of regions: ');
+
+            if isnumeric(num_regions_input) && isscalar(num_regions_input) && ...
+               num_regions_input <= 1000 && num_regions_input >= 1
+                break;
+            else
+                fprintf('Error: The number of regions must be an integer between 1 and 1000.\n');
+            end
+        end
+    end
+
+else
+    if ~(isnumeric(num_regions_input) && isscalar(num_regions_input) && ...
+         num_regions_input <= 1000 && num_regions_input >= 1)
+        error('The number of regions must be an integer between 1 and 1000.');
+    end
+
+    if use_user_partition && num_regions_input ~= length(unique(bus_region_map(:,2)))
+        error('num_regions_input does not match the number of unique regions in bus_region_map.');
+    end
+end
+
+%% Handle weighted / unweighted adjacency option
+if nargin < 3 || isempty(use_weighted)
+    use_weighted = false;  % default: unweighted adjacency
+else
+    % Make sure it's logical
+    use_weighted = logical(use_weighted);
+end
+The_max_of_attempts = 50;
+
+filename = ['''' case_input ''''];   
+filename = case_input;              
+The_number_of_regions = num_regions_input;mdata=0;
+%% ===================== Print Header ============================
+%% Determine partitioning and weighting scheme
+if use_user_partition
+    partitioning_mode = "User-defined bus-to-region assignment";
+    weighting_scheme = "Not used";
+elseif use_weighted
+    partitioning_mode = "Automatic spectral clustering";
+    weighting_scheme = "Weighted (x + b + Smax)";
+else
+    partitioning_mode = "Automatic spectral clustering";
+    weighting_scheme = "Unweighted (0/1 adjacency)";
+end
+
+
+fprintf('\n============================================================\n');
+fprintf('                 Running DPLib Partitioning\n');
+fprintf('============================================================\n');
+fprintf(' Case name                 : %s\n', case_input);
+fprintf(' Number of regions (k)     : %d\n', The_number_of_regions);
+fprintf(' Partitioning mode         : %s\n', partitioning_mode);
+fprintf(' Weighting scheme          : %s\n', weighting_scheme);
+fprintf(' Max outer attempts        : %d\n', The_max_of_attempts);
+fprintf('------------------------------------------------------------\n\n');
+
+
+%% Load MATPOWER case and set maximum clustering attempts
+
+tic;
+mpc = loadcase(filename); 
+
+
+%% If bus numbers are not sequential, renumber buses from 1 to N Also update branch and generator connections accordingly
+
+old_bus_numbers = mpc.bus(:,1);
+original_bus_numbers = old_bus_numbers;   % Used for user-defined bus-to-region assignments
+a=length(old_bus_numbers);
+b=max(old_bus_numbers);
+
+if a~=b
+    new_bus_numbers = (1:length(old_bus_numbers))'; % Sequential numbering
+    bus_map = containers.Map(old_bus_numbers, new_bus_numbers);
+    
+  
+    mpc_new = mpc;
+    mpc_new.bus(:,1) = new_bus_numbers;
+
+    for i = 1:size(mpc.branch, 1)
+        mpc_new.branch(i,1) = bus_map(mpc.branch(i,1)); % From bus
+        mpc_new.branch(i,2) = bus_map(mpc.branch(i,2)); % To bus
+    end
+    
+    for i = 1:size(mpc.gen, 1)
+        mpc_new.gen(i,1) = bus_map(mpc.gen(i,1)); % Generator bus
+    end
+    
+    fprintf('Bus numbers are renumbered from [%d - %d] to [1 - %d].\n', ...
+            min(old_bus_numbers), max(old_bus_numbers), length(old_bus_numbers));
+
+    mpc=mpc_new;
+end
+
+% Extract bus and branch data
+bus = mpc.bus;
+branch = mpc.branch;
+num_buses = size(bus, 1);
+num_branches = size(branch, 1); % Total number of branches
+num_gens = size(mpc.gen, 1); % Total number of generators
+num_gencosts = size(mpc.gencost, 1); % Total number of generator costs
+reference_bus = bus(bus(:,2) == 3, 1); % Find bus with type 3 (slack bus)
+if use_user_partition
+    bus_regions = read_user_partition(bus_region_map, original_bus_numbers);
+    num_clusters = max(bus_regions);
+    The_number_of_regions = num_clusters;
+else
+    num_clusters = The_number_of_regions; % Number of regions
+end
+max_iterations = The_max_of_attempts; % Maximum attempts to find the best clustering
+min_tie_lines = num_branches; % Initialize with the worst possible case
+    num_neigh_bus_list = zeros(num_clusters, 1);
+% Define variable names for each region
+num_regions = num_clusters; % adjust as needed
+
+% Generate region_names like 'mpc_regionR1', ..., 'mpc_regionR50'
+region_names = arrayfun(@(r) ['mpc_regionR' num2str(r)], 1:num_regions, 'UniformOutput', false);
+
+% Generate Bus_list like 'regionR1list', ..., 'regionR50list'
+Bus_list = arrayfun(@(r) ['regionR' num2str(r) 'list'], 1:num_regions, 'UniformOutput', false);
+
+% Initialize best regions storage
+best_mpc_regions = cell(num_clusters, 1);
+best_tie_lines = [];
+best_total_region_branches = 0;
+best_total_region_buses = 0;
+best_total_region_gens = 0;
+best_total_region_gencosts = 0;
+
+%% Construct the graph adjacency matrix from branch connectivity and compute graph Laplacian and check connectivity
+
+%% Construct the graph adjacency matrix (weighted or unweighted)
+
+
+if use_weighted
+    % Extract raw parameters
+    x_raw = abs(branch(:,4));     % reactance
+    b_raw = abs(branch(:,5));     % susceptance
+    S_raw = abs(branch(:,6));     % thermal limit (rateA)
+
+    % Guard against zero or NaN
+    x_raw(x_raw==0 | isnan(x_raw)) = mean(x_raw(x_raw>0));
+    b_raw(b_raw==0 | isnan(b_raw)) = mean(b_raw(b_raw>0));
+    S_raw(S_raw==0 | isnan(S_raw)) = mean(S_raw(S_raw>0));
+
+    % Z-score normalization
+    x_norm = (x_raw - mean(x_raw)) ./ std(x_raw);
+    b_norm = (b_raw - mean(b_raw)) ./ std(b_raw);
+    S_norm = (S_raw - mean(S_raw)) ./ std(S_raw);
+
+    % Combined equal-weight metric
+    weight_vector = abs(x_norm) + abs(b_norm) + abs(S_norm);
+end
+
+
+adj_matrix = sparse(num_buses, num_buses);
+
+for i = 1:num_branches
+    fbus = branch(i, 1);
+    tbus = branch(i, 2);
+
+    if use_weighted
+        % Extract electrical parameters
+        w_ij = weight_vector(i);
+        % In case some lines have zero/NaN limits, you can guard it:
+        if isnan(w_ij) || w_ij == 0
+            w_ij = 1;    % fallback to 1 if needed
+        end
+
+        adj_matrix(fbus, tbus) = w_ij;
+        adj_matrix(tbus, fbus) = w_ij;  % undirected graph
+
+    else
+        % Original unweighted adjacency
+        adj_matrix(fbus, tbus) = 1;
+        adj_matrix(tbus, fbus) = 1;
+    end
+end
+
+
+% Compute degree matrix
+D = diag(sum(adj_matrix, 2));
+
+% Compute graph Laplacian
+L = D - adj_matrix;
+
+G = graph(L);
+bins = conncomp(G);
+num_components = max(bins);
+
+%% Try multiple clusterings to find one with minimum inter-regional tie-lines
+
+
+% Initialize best solution trackers to avoid undefined variable errors
+best_tie_line_info = {};
+best_mpc_regions = {};
+best_tie_lines = [];
+best_total_region_branches = 0;
+best_total_region_buses = 0;
+best_total_region_gens = 0;
+best_total_region_gencosts = 0;
+
+
+% Iterate multiple times in automatic mode.
+% In user-defined mode, use the provided bus_regions once.
+if use_user_partition
+    max_partition_attempts = 1;
+else
+    max_partition_attempts = max_iterations;
+end
+
+% ------------------------------------------------------------
+% Sensitivity/statistics storage for repeated k-means runs
+% ------------------------------------------------------------
+sensitivity_run_id          = [];
+sensitivity_outer_iter      = [];
+sensitivity_inner_run       = [];
+sensitivity_tie_lines       = [];
+sensitivity_is_valid        = [];
+sensitivity_has_empty_region = [];
+sensitivity_has_genless_region = [];
+sensitivity_min_region_buses = [];
+sensitivity_max_region_buses = [];
+sensitivity_std_region_buses = [];
+sensitivity_min_region_gens  = [];
+sensitivity_max_region_gens  = [];
+sensitivity_std_region_gens  = [];
+
+sensitivity_counter = 0;
+
+for iter = 1:max_partition_attempts
+    fprintf('Iteration %d/%d\n', iter, max_partition_attempts);
+if ~use_user_partition
+
+    opts.maxit = 1000; % Increase iterations
+    opts.tol = 1e-5; % Increase tolerance
+
+    % Compute first few eigenvectors of L
+    L_full = full(L);
+    [V, D] = eig(L_full);
+    [~, idx] = sort(diag(D));
+    eig_vectors = V(:, idx(1:num_clusters));
+
+    % Normalize eigenvectors for better clustering performance
+    eig_vectors = eig_vectors ./ vecnorm(eig_vectors, 2, 2);
+
+    % Apply k-means to eigenvectors
+    best_cluster_labels = [];
+    best_tie_line_count = inf; 
+
+for k_run = 1:max_iterations  
+
+    % One repeated k-means experiment.
+    % Replicates = 10 means MATLAB internally tries 10 centroid initializations
+    % and returns the best clustering for this k_run.
+    temp_cluster_labels = kmeans(eig_vectors, num_clusters, 'Replicates', 10);
+
+    % Convert cluster labels to bus-region vector
+    temp_bus_regions = zeros(num_buses, 1);
+    temp_bus_regions(1:length(temp_cluster_labels)) = temp_cluster_labels;
+
+    % ------------------------------------------------------------
+    % Compute region bus counts and generator counts
+    % ------------------------------------------------------------
+    temp_region_bus_counts = zeros(num_clusters, 1);
+    temp_region_gen_counts = zeros(num_clusters, 1);
+
+    temp_branch_assignment = false(num_branches, 1);
+
+    for r = 1:num_clusters
+        temp_region_buses = bus(ismember(bus(:,1), find(temp_bus_regions == r)), 1);
+
+        temp_region_bus_counts(r) = length(temp_region_buses);
+
+        temp_region_gen_counts(r) = sum(ismember(mpc.gen(:,1), temp_region_buses));
+
+        temp_branch_assignment = temp_branch_assignment | ...
+            (ismember(branch(:,1), temp_region_buses) & ismember(branch(:,2), temp_region_buses));
+    end
+
+    % Tie-lines are branches not assigned to any internal regional branch set
+    temp_tie_line_count = sum(~temp_branch_assignment);
+
+    % Validity checks for this candidate
+    temp_has_empty_region = any(temp_region_bus_counts == 0);
+    temp_has_genless_region = any(temp_region_gen_counts == 0);
+
+    temp_branch_accounting_ok = ...
+        (sum(temp_branch_assignment) + temp_tie_line_count == num_branches);
+
+    temp_is_valid = ~temp_has_empty_region && ...
+                    ~temp_has_genless_region && ...
+                    temp_branch_accounting_ok;
+
+    % ------------------------------------------------------------
+    % Store sensitivity/statistics for this k-means run
+    % ------------------------------------------------------------
+    sensitivity_counter = sensitivity_counter + 1;
+
+    sensitivity_run_id(end+1,1) = sensitivity_counter;
+    sensitivity_outer_iter(end+1,1) = iter;
+    sensitivity_inner_run(end+1,1) = k_run;
+    sensitivity_tie_lines(end+1,1) = temp_tie_line_count;
+    sensitivity_is_valid(end+1,1) = temp_is_valid;
+    sensitivity_has_empty_region(end+1,1) = temp_has_empty_region;
+    sensitivity_has_genless_region(end+1,1) = temp_has_genless_region;
+
+    sensitivity_min_region_buses(end+1,1) = min(temp_region_bus_counts);
+    sensitivity_max_region_buses(end+1,1) = max(temp_region_bus_counts);
+    sensitivity_std_region_buses(end+1,1) = std(temp_region_bus_counts);
+
+    sensitivity_min_region_gens(end+1,1) = min(temp_region_gen_counts);
+    sensitivity_max_region_gens(end+1,1) = max(temp_region_gen_counts);
+    sensitivity_std_region_gens(end+1,1) = std(temp_region_gen_counts);
+
+    % ------------------------------------------------------------
+    % Select best candidate among valid candidates only
+    % ------------------------------------------------------------
+    if temp_is_valid && temp_tie_line_count < best_tie_line_count
+        best_tie_line_count = temp_tie_line_count;
+        best_cluster_labels = temp_cluster_labels;
+    end
+end
+
+    if isempty(best_cluster_labels)
+    % No valid k-means candidate was found in this outer iteration
+    continue;
+    end
+
+cluster_labels = best_cluster_labels;
+
+    % Compute centroids of each cluster in the spectral domain
+    region_centroids = zeros(num_clusters, size(eig_vectors, 2));
+    for r = 1:num_clusters
+        region_centroids(r, :) = mean(eig_vectors(cluster_labels == r, :), 1);
+    end
+
+    % Use pairwise Euclidean distances between centroids
+    dist_matrix = squareform(pdist(region_centroids, 'euclidean'));
+
+    % Use hierarchical clustering to get an ordering
+    linkage_order = linkage(region_centroids, 'average');
+    region_order = optimalleaforder(linkage_order, dist_matrix);
+
+    % Re-map cluster labels and reorder regions accordingly
+    remapped_labels = zeros(size(cluster_labels));
+    for i = 1:num_clusters
+        remapped_labels(cluster_labels == region_order(i)) = i;
+    end
+    cluster_labels = remapped_labels;
+
+    % Assign buses to regions
+    bus_regions = zeros(num_buses, 1);
+    bus_regions(1:length(cluster_labels)) = cluster_labels;
+
+else
+
+    % User-defined mode: bus_regions was already created from bus_region_map
+    cluster_labels = bus_regions;
+
+end
+
+
+% Ensure all regions contain at least one bus
+if length(unique(cluster_labels)) < num_clusters
+    if use_user_partition
+        error('The user-defined bus_region_map creates one or more empty regions.');
+    else
+        continue; % Skip this iteration if some clusters are empty
+    end
+end
+
+% Temporary storage for regional cases
+temp_mpc_regions = cell(num_clusters, 1);
+total_region_branches = 0; % Track the sum of branches in regions
+total_region_buses = 0; % Track buses
+total_region_gens = 0; % Track generators
+total_region_gencosts = 0; % Track generator costs
+branch_assignment = false(num_branches, 1); % Track branch assignment
+invalid_partition = false;
+
+for r = 1:num_clusters
+    % Ensure valid indexing using `ismember`
+    region_buses = bus(ismember(bus(:,1), find(bus_regions == r)), 1);
+
+        if isempty(region_buses)
+            continue;
+        end
+        
+        % Create a regional copy of the original case
+        mpc_region = mpc;
+        
+        % Select buses belonging to this region
+        mpc_region.bus = bus(ismember(bus(:,1), region_buses), :);
+        num_region_buses = size(mpc_region.bus, 1);
+        total_region_buses = total_region_buses + num_region_buses;
+
+        % Select branches where both ends are in the same region
+        in_region = ismember(branch(:,1), region_buses) & ismember(branch(:,2), region_buses);
+        mpc_region.branch = branch(in_region, :);
+        
+        % Count branches in this region
+        num_region_branches = size(mpc_region.branch, 1);
+        total_region_branches = total_region_branches + num_region_branches;
+        
+        % Mark these branches as assigned
+        branch_assignment(in_region) = true;
+        
+        % Select generators in this region
+        in_region_gen = ismember(mpc.gen(:,1), region_buses);
+        mpc_region.gen = mpc.gen(in_region_gen, :);
+        num_region_gens = size(mpc_region.gen, 1);
+        total_region_gens = total_region_gens + num_region_gens;
+if num_region_gens == 0
+    invalid_partition = true;
+    break; % Exit loop early since this region has no generators
+end
+
+
+        % Select gencosts for generators in this region
+        mpc_region.gencost = mpc.gencost(in_region_gen, :);
+        num_region_gencosts = size(mpc_region.gencost, 1);
+        total_region_gencosts = total_region_gencosts + num_region_gencosts;
+        temp_mpc_regions{r} = mpc_region;
+    end
+if invalid_partition
+    if use_user_partition
+        error(['The user-defined partition has at least one region with no generator. ', ...
+               'This partition cannot be validated using the current OPF-based validation workflow.']);
+    else
+        continue; % Skip to next iteration of outer loop
+    end
+end
+
+%% Identify tie-line branches that connect different regions
+
+    temp_tie_lines = branch(~branch_assignment, :); % Any unassigned branch is a tie-line
+    num_temp_tie_lines = size(temp_tie_lines, 1);
+    
+    tie_line_info = cell(num_temp_tie_lines, 3); % Store tie-line region connections
+    % Initialize storage for neighboring buses in each region
+
+    for i = 1:num_temp_tie_lines
+        fbus = temp_tie_lines(i, 1);
+        tbus = temp_tie_lines(i, 2);
+        
+        region_f = bus_regions(bus(:,1) == fbus);
+        region_t = bus_regions(bus(:,1) == tbus);
+        
+        tie_line_info{i, 1} = region_names{region_f}; % From region
+        tie_line_info{i, 2} = region_names{region_t}; % To region
+        tie_line_info{i, 3} = temp_tie_lines(i, :);  % Branch data
+            % Store tie-line buses as neighboring buses in respective regions
+
+    end
+%% Update best partitioning if it results in fewer tie-lines
+
+    % Check if the sum of region branches + tie-lines matches the total branches
+    total_count = total_region_branches + num_temp_tie_lines;
+    
+    if total_count == num_branches && num_temp_tie_lines < min_tie_lines
+        min_tie_lines = num_temp_tie_lines;
+        best_mpc_regions = temp_mpc_regions;
+        best_tie_lines = temp_tie_lines;
+        best_total_region_branches = total_region_branches;
+        best_total_region_buses = total_region_buses;
+        best_total_region_gens = total_region_gens;
+        best_total_region_gencosts = total_region_gencosts;
+        best_tie_line_info = tie_line_info;
+    end
+
+end
+
+%% If no valid clustering was found
+if isempty(best_tie_line_info)
+    fprintf('\n==============================================================\n');
+    fprintf('   ❌  NO VALID PARTITIONING FOUND\n');
+    fprintf('==============================================================\n');
+    fprintf('Reason: None of the %d clustering attempts produced a valid\n', max_iterations);
+    fprintf('partitioning where every region has at least one generator\n');
+    fprintf('and all branches (internal + tie-lines) were accounted for.\n\n');
+    fprintf('Suggested fixes:\n');
+    fprintf('  • Reduce the number of requested regions (k = %d)\n', num_clusters);
+    fprintf('  • Increase the number of attempts (The_max_of_attempts)\n');
+    fprintf('  • Inspect generator distribution — some regions may end up\n');
+    fprintf('    without generators.\n');
+    fprintf('==============================================================\n\n');
+
+    % Return a properly defined result struct to avoid MATLAB error
+    result = struct();
+    result.status            = 'infeasible';
+    result.message           = 'No valid partitioning found.';
+    result.num_regions       = num_clusters;
+    result.original_case     = filename;
+    result.num_buses         = num_buses;
+    result.num_branches      = num_branches;
+    result.num_gens          = num_gens;
+
+    return;
+end
+
+
+
+num_of_areas=0;
+% Write tie-line table to Excel
+tie_line_table1 = cell2table(best_tie_line_info, 'VariableNames', {'From_Region', 'To_Region', 'Branch_Data'});
+
+
+
+all_partitioned_buses = [];
+for r = 1:num_clusters
+    if ~isempty(best_mpc_regions{r})
+        all_partitioned_buses = [all_partitioned_buses; best_mpc_regions{r}.bus(:,1)];
+    end
+end
+
+% Find missing buses
+missing_buses = setdiff(bus(:,1), all_partitioned_buses);
+
+%% Export partition map as CSV using original centralized bus numbers
+% Output format:
+%   bus_number, area_number
+%
+% bus_number  = original bus number from the centralized MATPOWER case
+% area_number = assigned region/area number
+
+partition_bus_numbers = original_bus_numbers(:);
+partition_area_numbers = bus_regions(:);
+
+partition_table = table(partition_bus_numbers, partition_area_numbers, ...
+    'VariableNames', {'bus_number', 'area_number'});
+
+partition_csv_filename = [case_input, '_', num2str(num_clusters), 'regions_partition.csv'];
+
+writetable(partition_table, partition_csv_filename);
+
+fprintf(' Partition CSV file generated : %s\n', partition_csv_filename);
+
+    reference_region = 0;
+    
+    for r = 1:num_clusters
+        if ~isempty(best_mpc_regions{r}) % Ensure region is valid
+            region_buses = best_mpc_regions{r}.bus(:,1); % Extract bus numbers in region
+            if any(region_buses == reference_bus)
+                reference_region = r;
+                break; % Stop searching once found
+            end
+        end
+    end
+
+ % Renumber buses from 1 to N for each region
+for r = 1:num_clusters
+    if ~isempty(best_mpc_regions{r})
+        % Extract region data
+        mpc_region = best_mpc_regions{r};
+        
+        % Create a mapping from old bus numbers to new bus numbers
+        old_bus_numbers = mpc_region.bus(:,1);
+        new_bus_numbers = (1:length(old_bus_numbers))';
+        bus_map = containers.Map(old_bus_numbers, new_bus_numbers);
+        
+        % Update the bus matrix (only first column)
+        mpc_region.bus(:,1) = new_bus_numbers;
+        
+        % Update branch matrix (only first and second columns)
+        for i = 1:size(mpc_region.branch,1)
+            mpc_region.branch(i,1) = bus_map(mpc_region.branch(i,1)); % From bus
+            mpc_region.branch(i,2) = bus_map(mpc_region.branch(i,2)); % To bus
+        end
+        
+        % Update generator matrix (only first column)
+        for i = 1:size(mpc_region.gen,1)
+            mpc_region.gen(i,1) = bus_map(mpc_region.gen(i,1)); % Generator bus
+        end
+        
+        % Store the updated region back
+        best_mpc_regions{r} = mpc_region;
+        bus_number_list{r}=[old_bus_numbers new_bus_numbers];
+    end
+end
+
+
+
+Updated_bus_data = cell(1, num_clusters); % Initialize cell array
+
+for r = 1:min(num_clusters, length(bus_number_list)) % Ensure r does not exceed available regions
+    if r > length(bus_number_list) || isempty(bus_number_list{r}) % Ensure region exists
+        continue; % Skip if the region is empty or out of range
+    end
+    
+    Updated_bus_data{r} = bus_number_list{r}; % Store as a separate cell
+end
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Ensure `bus_number_list` is correctly sized
+num_valid_regions = min(num_clusters, length(bus_number_list));
+
+% Determine the maximum number of buses in any region
+max_rows = max(cellfun(@(x) size(x, 1), bus_number_list(1:num_valid_regions))); 
+
+% Create a numeric matrix filled with NaN (to handle different region sizes)
+Updated_bus_matrix = NaN(max_rows, num_valid_regions * 3 - 1); % Includes space for empty columns
+
+% Fill the matrix with bus numbers (both columns)
+for r = 1:num_valid_regions
+    if ~isempty(bus_number_list{r}) % Ensure the region is not empty
+        num_buses_in_region = size(bus_number_list{r}, 1);
+        
+        % Determine column indices (1st and 2nd column for the region, then an empty one)
+        col_start = (r - 1) * 3 + 1;
+        col_end = col_start + 1;
+        
+        % Ensure data fits within the allocated space
+        Updated_bus_matrix(1:num_buses_in_region, col_start:col_end) = bus_number_list{r}(1:min(num_buses_in_region, max_rows), :);
+    end
+end
+
+% Convert to table
+Updated_bus_table = array2table(Updated_bus_matrix);
+
+% Define column names dynamically with unique names for empty columns
+column_names = strings(1, num_valid_regions * 3 - 1);
+empty_col_count = 1; % Counter for unique empty column names
+
+for r = 1:num_valid_regions
+    col_start = (r - 1) * 3 + 1;
+    column_names(col_start) = "Region_" + string(r) + "_Col1";
+    column_names(col_start + 1) = "Region_" + string(r) + "_Col2";
+    
+    % Add a unique name for empty columns
+    if r < num_valid_regions
+        column_names(col_start + 2) = "Empty_Col_" + string(empty_col_count);
+        empty_col_count = empty_col_count + 1;
+    end
+end
+Updated_bus_table.Properties.VariableNames = column_names;
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+for r = 1:num_clusters
+    if ~isempty(best_mpc_regions{r})
+
+        % DO NOT assign to base; just keep region data local
+        % assignin('base', region_names{r}, best_mpc_regions{r});
+
+        % Define the file name for saving (kept for consistency / messages)
+        mat_filename = [region_names{r}, '.mat'];
+
+        % Local copy (if you want to later use it, though you already have best_mpc_regions)
+        region_data = best_mpc_regions{r};  %#ok<NASGU>
+
+        % Increment the counter for valid regions
+        num_of_areas = num_of_areas + 1;
+        
+
+    end
+end
+
+
+
+%% Confirm that all original buses are included in the partitioning
+
+
+
+
+
+
+%% Map tie-line buses to updated bus numbers within each region and build a structure (save_struct) containing all regions and tie-line info
+
+    dataMatrix = table2cell(tie_line_table1);
+    dataMatrix2 = table2array(Updated_bus_table);
+
+    alphabet = 'A':'Z';
+    save_struct = struct();
+
+    % Loop through each region
+    for r = 1:num_clusters
+        region_letter = ['R' num2str(r)];
+        region_varname = ['mpc_region' region_letter];
+        region_tie = ['interregional_tielines' region_letter];
+        region_tienum = ['num_interregional_tielines' region_letter];
+    outq2 = dataMatrix2(:,3*r-2:3*r-1);
+
+    nanIndex = find(isnan(outq2(:, 1)), 1);
+    
+    % If there is no NaN, just return the original matrix
+    if isempty(nanIndex)
+        out2 = outq2;
+    else
+        % Otherwise, create a new matrix with only the non-NaN rows
+        out2 = outq2(1:nanIndex-1, :);
+    end
+
+        % Find rows where the string matches in the first or second column
+    region_old_name = ['mpc_regionR' num2str(r)]; % Old variable name to search in dataMatrix
+    row_indices = strcmp(dataMatrix(:, 1), region_old_name) | strcmp(dataMatrix(:, 2), region_old_name);
+    
+    filteredData = dataMatrix(row_indices, :);
+    output_rows = cell2mat(filteredData(:, 3:end));
+    output_rowss = dataMatrix(row_indices, :);
+        % Convert back to a table for easy saving
+
+    A=output_rows;B=out2;
+m = size(A,1);      % number of rows in first matrix (A)
+n = size(B,1);      % number of rows in second matrix (B)  --> 642
+key2value = containers.Map(B(:,1), B(:,2));
+
+A_out = A;          % start with A and overwrite in-place
+
+for i = 1:m
+    for j = 1:2
+        v = A(i,j);            % element under inspection
+        if isKey(key2value, v) % this is the “matching” element
+            A_out(i,j) = key2value(v);
+        else                   % this is the non-matching element
+            A_out(i,j) = i + n;
+        end
+    end
+end
+for i = 1:size(output_rowss, 1)
+    output_rowss{i, 3} = A_out(i, :); % Replace the 3rd column with the corresponding row from A_out
+end
+numtie=size(output_rowss, 1);
+    outputTable = cell2table(output_rowss);
+   
+    % Get the region data directly from best_mpc_regions instead of base workspace
+    region_idx = r;  % because region_old_name = 'mpc_regionR<r>'
+    if region_idx <= numel(best_mpc_regions) && ~isempty(best_mpc_regions{region_idx})
+        region_data = best_mpc_regions{region_idx};
+        save_struct.(region_varname) = region_data;
+        if mdata==1
+            save_struct.(region_tie) = outputTable;
+        end
+        % save_struct.(region_tienum) = numtie;
+    else
+        warning('Region data for %s not found in best_mpc_regions.', region_old_name);
+    end
+
+    end
+
+save_struct.num_regions = num_clusters;
+%save_struct.new_bus_labels=Updated_bus_table;
+save_struct.filename = filename;
+
+% Save centralized bus-to-area partition map
+save_struct.partition_table = partition_table;
+save_struct.partition_csv_filename = partition_csv_filename;
+
+dataMatrix = table2cell(tie_line_table1);
+    dataMatrix2 = table2array(Updated_bus_table);
+
+for i = 1:size(dataMatrix, 1)
+    region1_str = dataMatrix{i, 1};
+    region2_str = dataMatrix{i, 2};
+    regiontiedata = dataMatrix{i, 3};
+    firstout = regiontiedata(1, 1);
+    secondout = regiontiedata(1, 2);
+
+    region1_num = sscanf(region1_str, 'mpc_regionR%d');
+    region2_num = sscanf(region2_str, 'mpc_regionR%d');
+
+    outq1 = dataMatrix2(:, 3*region1_num-2:3*region1_num-1);
+    outq2 = dataMatrix2(:, 3*region2_num-2:3*region2_num-1);
+
+    nanIndex1 = find(isnan(outq1(:, 1)), 1); 
+    nanIndex2 = find(isnan(outq2(:, 1)), 1);
+
+    if isempty(nanIndex1)
+        out1 = outq1;
+    else
+        out1 = outq1(1:nanIndex1-1, :);
+    end
+
+    if isempty(nanIndex2)
+        out2 = outq2;
+    else
+        out2 = outq2(1:nanIndex2-1, :);
+    end
+
+    % --- Replace firstout with second column value from out1 ---
+    idx1 = find(out1(:, 1) == firstout, 1);
+    if ~isempty(idx1)
+        regiontiedata(1, 1) = out1(idx1, 2);
+    end
+
+    % --- Replace secondout with second column value from out2 ---
+    idx2 = find(out2(:, 1) == secondout, 1);
+    if ~isempty(idx2)
+        regiontiedata(1, 2) = out2(idx2, 2);
+    end
+
+    % --- Update the dataMatrix with modified regiontiedata ---
+    dataMatrix{i, 3} = regiontiedata;
+end
+tie_line_table1 = cell2table(dataMatrix);
+save_struct.interregional_tielines_total = tie_line_table1;
+
+% ------------------------------------------------------------
+% Build sensitivity/statistics table for repeated k-means runs
+% ------------------------------------------------------------
+if use_user_partition
+    sensitivity_table = table();
+    sensitivity_summary = table();
+else
+    sensitivity_table = table( ...
+        sensitivity_run_id, ...
+        sensitivity_outer_iter, ...
+        sensitivity_inner_run, ...
+        sensitivity_tie_lines, ...
+        logical(sensitivity_is_valid), ...
+        logical(sensitivity_has_empty_region), ...
+        logical(sensitivity_has_genless_region), ...
+        sensitivity_min_region_buses, ...
+        sensitivity_max_region_buses, ...
+        sensitivity_std_region_buses, ...
+        sensitivity_min_region_gens, ...
+        sensitivity_max_region_gens, ...
+        sensitivity_std_region_gens, ...
+        'VariableNames', { ...
+            'RunID', ...
+            'OuterIteration', ...
+            'InnerKMeansRun', ...
+            'TieLines', ...
+            'IsValid', ...
+            'HasEmptyRegion', ...
+            'HasGeneratorlessRegion', ...
+            'MinRegionBuses', ...
+            'MaxRegionBuses', ...
+            'StdRegionBuses', ...
+            'MinRegionGens', ...
+            'MaxRegionGens', ...
+            'StdRegionGens' ...
+        });
+
+    valid_idx = sensitivity_table.IsValid;
+
+    if any(valid_idx)
+        valid_tie_lines = sensitivity_table.TieLines(valid_idx);
+
+        sensitivity_summary = table( ...
+            height(sensitivity_table), ...
+            sum(valid_idx), ...
+            min(valid_tie_lines), ...
+            max(valid_tie_lines), ...
+            mean(valid_tie_lines), ...
+            std(valid_tie_lines), ...
+            median(valid_tie_lines), ...
+            100 * sum(valid_tie_lines == min(valid_tie_lines)) / numel(valid_tie_lines), ...
+            'VariableNames', { ...
+                'TotalRuns', ...
+                'ValidRuns', ...
+                'BestTieLines', ...
+                'WorstTieLines', ...
+                'MeanTieLines', ...
+                'StdTieLines', ...
+                'MedianTieLines', ...
+                'BestTieLineFrequencyPercent' ...
+            });
+    else
+        sensitivity_summary = table( ...
+            height(sensitivity_table), ...
+            0, ...
+            NaN, NaN, NaN, NaN, NaN, NaN, ...
+            'VariableNames', { ...
+                'TotalRuns', ...
+                'ValidRuns', ...
+                'BestTieLines', ...
+                'WorstTieLines', ...
+                'MeanTieLines', ...
+                'StdTieLines', ...
+                'MedianTieLines', ...
+                'BestTieLineFrequencyPercent' ...
+            });
+    end
+end
+
+% Store k-means sensitivity/statistics results
+save_struct.kmeans_sensitivity_table = sensitivity_table;
+save_struct.kmeans_sensitivity_summary = sensitivity_summary;
+
+% Create .m file name
+mfilename = [filename, '_', num2str(num_clusters), 'regions.m'];
+mfilename2 = [filename, '_', num2str(num_clusters), 'regions'];
+fid = fopen(mfilename, 'w');
+% Define user information
+author_name = 'Milad Hasanzadeh';
+generation_date = string(datetime('now','Format','yyyy-MM-dd'));
+
+
+% Write custom header
+fprintf(fid, '%% -------------------------------------------------------------------------\n');
+fprintf(fid, '%% Partitioned MATPOWER Case File\n');
+fprintf(fid, '%% Copyright (c) 2025 %s\n', author_name);
+fprintf(fid, '%% Generated on: %s\n', generation_date);
+fprintf(fid, '%% This file contains partitioned data for %d regions\n\n\n', num_clusters);
+
+% Loop through regions and write each mpc_regionR* as a separate struct
+for r = 1:num_clusters
+    regionID = ['R', num2str(r)];
+    varname = ['mpc_region', regionID];
+
+    if isfield(save_struct, varname)
+        mpc = save_struct.(varname);  % Get region struct
+
+        fprintf(fid, '%% -------------------- %s --------------------\n\n', varname);
+        fprintf(fid, '%s.version = ''2'';\n', varname);
+
+        if isfield(mpc, 'baseMVA')
+            fprintf(fid, '%s.baseMVA = %.4f;\n', varname, mpc.baseMVA);
+        else
+            fprintf(fid, '%s.baseMVA = 100;\n', varname);
+        end
+
+        if isfield(mpc, 'bus')
+            fprintf(fid, '%s.bus = [\n', varname);
+            bus_headers = {'bus_i','type','Pd','Qd','Gs','Bs','area','Vm','Va','baseKV','zone','Vmax','Vmin'}; 
+            fprintf_matrix(fid, mpc.bus, bus_headers);
+            fprintf(fid, '];\n\n');
+        end
+
+        if isfield(mpc, 'gen')
+            fprintf(fid, '%s.gen = [\n', varname);
+            gen_headers = {'bus','Pg','Qg','Qmax','Qmin','Vg','mBase','status','Pmax','Pmin','Pc1','Pc2','Qc1min','Qc1max','Qc2min','Qc2max','ramp_agc','ramp_10','ramp_30','ramp_q','apf'};
+            fprintf_matrix(fid, mpc.gen, gen_headers);
+            fprintf(fid, '];\n\n');
+        end
+
+        if isfield(mpc, 'branch')
+            fprintf(fid, '%s.branch = [\n', varname);
+             branch_headers = {'fbus','tbus','r','x','b','rateA','rateB','rateC','ratio','angle','status','angmin','angmax'};
+            fprintf_matrix(fid, mpc.branch, branch_headers);
+            fprintf(fid, '];\n\n');
+        end
+
+        if isfield(mpc, 'gencost')
+            fprintf(fid, '%s.gencost = [\n', varname);
+            gencost_headers = {'2','startup','shutdown','n','c(n-1)...c0'};
+            fprintf_matrix(fid, mpc.gencost, gencost_headers);
+            fprintf(fid, '];\n\n');
+        end
+
+        fprintf(fid, '\n');
+    end
+end
+
+%% Write the full interregional_tielines_total cell array
+if isfield(save_struct, 'interregional_tielines_total')
+    fprintf(fid, '%% ---------- Interregional Tie-Line Information ----------\n');
+    fprintf(fid, '%% Each row: {From_Region (string), To_Region (string), Branch_Data (1x13 array)}\n');
+    fprintf(fid, '%% Branch_Data: {fbus, tbus, r, x, b, rateA, rateB, rateC, ratio, angle, status, angmin, angmax}\n\n');
+    tie_cell = table2cell(save_struct.interregional_tielines_total);  % ensure it's a cell array
+
+    fprintf(fid, 'interregional_tielines_total = {\n');
+    for i = 1:size(tie_cell, 1)
+        from_region = tie_cell{i, 1};
+        to_region   = tie_cell{i, 2};
+        branch_data = tie_cell{i, 3};
+
+        fprintf(fid, '\t{''%s'', ''%s'', [', from_region, to_region);
+        for j = 1:length(branch_data)
+            if j < length(branch_data)
+                fprintf(fid, '% .12g\t', branch_data(j));
+            else
+                fprintf(fid, '% .12g', branch_data(j));
+            end
+        end
+        fprintf(fid, ']},\n');
+    end
+    fprintf(fid, '};\n\n');
+end
+
+
+
+fclose(fid);
+
+
+filename = [filename, '_', num2str(num_clusters), 'regions.mat'];
+save(filename, '-struct', 'save_struct');
+filenamee = filename;
+% --- Graph-Based Visualization of Regional Topology ---
+
+plot_partitioned_matfile(filenamee);
+
+exportgraphics(gcf, [mfilename2, '_topology.png'], 'Resolution', 300);
+
+
+elapsed_time = toc;
+% -------- Build single structured result to return --------
+result = struct();
+result.save_struct       = save_struct;
+result.tie_line_table    = tie_line_table1;
+result.Updated_bus_table = Updated_bus_table;
+result.best_mpc_regions  = best_mpc_regions;
+result.min_tie_lines     = min_tie_lines;
+result.reference_bus     = reference_bus;
+result.reference_region  = reference_region;
+result.missing_buses     = missing_buses;
+result.num_components    = num_components;
+result.num_regions       = num_clusters;
+result.original_case     = filename;
+result.mat_filename      = filename;
+result.m_filename        = mfilename;
+result.topology_png      = [mfilename2, '_topology.png'];
+result.elapsed_time_sec  = elapsed_time;
+result.partitioning_mode = partitioning_mode;
+result.bus_regions       = bus_regions;
+result.partition_table   = partition_table;
+result.partition_csv     = partition_csv_filename;
+result.kmeans_sensitivity_table = sensitivity_table;
+result.kmeans_sensitivity_summary = sensitivity_summary;
+
+%% ===================== Summary Print ============================
+fprintf('\n============================================================\n');
+fprintf('                    DPLib Partitioning Summary\n');
+fprintf('============================================================\n');
+fprintf(' Case name                     : %s\n', case_input);
+fprintf(' Number of regions (k)         : %d\n', num_clusters);
+fprintf(' Partitioning mode             : %s\n', partitioning_mode);
+fprintf(' Weighting scheme              : %s\n', weighting_scheme);
+
+% Connectivity check
+if num_components == 1
+    fprintf(' Graph connectivity            : Connected\n');
+else
+    fprintf(' Graph connectivity            : NOT fully connected\n');
+end
+
+% Bus renumbering check
+if a~=b
+    fprintf(' Global bus renumbering        : Applied (non-sequential numbering fixed)\n');
+else
+    fprintf(' Global bus renumbering        : Not needed (already sequential)\n');
+end
+
+fprintf(' Reference bus                 : %d\n', reference_bus);
+fprintf(' Reference bus region          : R%d\n', reference_region);
+fprintf(' Min inter-regional tie-lines  : %d\n', min_tie_lines);
+fprintf('------------------------------------------------------------\n');
+if ~use_user_partition && ~isempty(sensitivity_summary)
+    fprintf(' k-means sensitivity runs      : %d total, %d valid\n', ...
+        sensitivity_summary.TotalRuns(1), sensitivity_summary.ValidRuns(1));
+    fprintf(' Tie-line count across valid runs: min = %.0f, mean = %.2f, std = %.2f, max = %.0f\n', ...
+        sensitivity_summary.BestTieLines(1), ...
+        sensitivity_summary.MeanTieLines(1), ...
+        sensitivity_summary.StdTieLines(1), ...
+        sensitivity_summary.WorstTieLines(1));
+    fprintf(' Best tie-line frequency       : %.2f %% of valid runs\n', ...
+        sensitivity_summary.BestTieLineFrequencyPercent(1));
+end
+fprintf(' Total region buses            : %d (original = %d)\n', ...
+        best_total_region_buses, num_buses);
+fprintf(' Total region branches         : %d (original = %d)\n', ...
+        best_total_region_branches, num_branches);
+fprintf(' Total region generators       : %d (original = %d)\n', ...
+        best_total_region_gens, num_gens);
+
+if use_user_partition
+    fprintf(' MaxAttempts (outer)           : Not used\n');
+    fprintf(' k-means replicates (inner)    : Not used\n');
+else
+    fprintf(' MaxAttempts (outer)           : %d\n', The_max_of_attempts);
+    fprintf(' k-means replicates (inner)    : %d\n', 10);
+end
+fprintf(' Elapsed time                  : %.2f s\n', elapsed_time);
+
+fprintf('------------------------------------------------------------\n');
+
+fprintf(' Output files generated:\n');
+fprintf('   %s\n', filenamee);
+fprintf('   %s\n', mfilename);
+fprintf('   %s_topology.png\n', mfilename2);
+
+fprintf('============================================================\n\n');
+
+
+
+
+
+
+
+
+
+
+end
+
+
+function bus_regions = read_user_partition(bus_region_map, original_bus_numbers)
+%READ_USER_PARTITION Validates a user-defined bus-to-region assignment.
+%
+% Input format:
+%   bus_region_map = [bus_number, region_number]
+%
+% The bus numbers must match the original MATPOWER bus numbers before any
+% internal renumbering is applied by the partitioning code.
+
+    if ~isnumeric(bus_region_map) || size(bus_region_map,2) ~= 2
+        error('bus_region_map must be a two-column numeric matrix: [bus_number, region_number].');
+    end
+
+    input_buses = bus_region_map(:,1);
+    input_regions = bus_region_map(:,2);
+
+    % Region labels must be positive integers
+    if any(input_regions < 1) || any(input_regions ~= round(input_regions))
+        error('Region numbers in bus_region_map must be positive integers.');
+    end
+
+    % Bus numbers must be unique
+    if length(unique(input_buses)) ~= length(input_buses)
+        error('Duplicate bus numbers found in bus_region_map.');
+    end
+
+    % Every original bus must appear exactly once
+    if length(input_buses) ~= length(original_bus_numbers)
+        error('bus_region_map must assign exactly one region to every bus in the MATPOWER case.');
+    end
+
+    missing_buses = setdiff(original_bus_numbers, input_buses);
+    extra_buses = setdiff(input_buses, original_bus_numbers);
+
+    if ~isempty(missing_buses)
+        error('bus_region_map is missing one or more buses from the MATPOWER case.');
+    end
+
+    if ~isempty(extra_buses)
+        error('bus_region_map contains buses that do not exist in the MATPOWER case.');
+    end
+
+    % Build bus_regions in the current internal bus order
+    num_buses = length(original_bus_numbers);
+    bus_regions = zeros(num_buses, 1);
+
+    for i = 1:num_buses
+        original_bus = original_bus_numbers(i);
+        row_idx = find(input_buses == original_bus, 1);
+        bus_regions(i) = input_regions(row_idx);
+    end
+
+    % Re-map region numbers to consecutive labels 1,...,K
+    % Example: regions [10, 20, 30] become [1, 2, 3]
+    unique_regions = sort(unique(bus_regions));
+    remapped_bus_regions = zeros(size(bus_regions));
+
+    for k = 1:length(unique_regions)
+        remapped_bus_regions(bus_regions == unique_regions(k)) = k;
+    end
+
+    bus_regions = remapped_bus_regions;
+end
+
+
+%% ------- Helper Function --------
+function fprintf_matrix(fid, matrix, col_headers)
+    if nargin > 2 && ~isempty(col_headers)
+        % Print column headers as a comment
+        fprintf(fid, '%%\t');
+        for i = 1:length(col_headers)
+            fprintf(fid, '%-12s', col_headers{i});
+        end
+        fprintf(fid, '\n');
+    end
+
+    [rows, cols] = size(matrix);
+    for i = 1:rows
+        fprintf(fid, '\t');
+        for j = 1:cols
+            if j < cols
+                fprintf(fid, '% .12g\t', matrix(i, j));
+            else
+                fprintf(fid, '% .12g', matrix(i, j));
+            end
+        end
+        fprintf(fid, ';\n');
+    end
+end
+
+function plot_partitioned_matfile(file_basename)
+    % Add .mat extension if not already present
+    if ~endsWith(file_basename, '.mat')
+        file_basename = [file_basename, '.mat'];
+    end
+fontsizew=17;
+
+    % Load the MAT file
+    if ~isfile(file_basename)
+        error('File "%s" not found.', file_basename);
+    end
+    data = load(file_basename);
+
+    % Use num_regions directly
+    if ~isfield(data, 'num_regions')
+        error('MAT file must contain variable "num_regions".');
+    end
+    num_regions = data.num_regions;
+
+    % Read tie-line table
+    if ~isfield(data, 'interregional_tielines_total')
+        error('MAT file must contain variable "interregional_tielines_total".');
+    end
+    tielines = data.interregional_tielines_total;
+    dataMatrix = table2cell(tielines);
+
+    % Build region_map
+    region_map = containers.Map;
+    for r = 1:num_regions
+        region_name = ['mpc_regionR', num2str(r)];
+        if ~isfield(data, region_name)
+            error('Missing region struct: %s', region_name);
+        end
+        region_map(region_name) = r;
+    end
+
+    % Build edge count
+    edge_count = containers.Map;
+    for i = 1:size(dataMatrix, 1)
+        r1 = region_map(dataMatrix{i,1});
+        r2 = region_map(dataMatrix{i,2});
+        key = sprintf('%d-%d', min(r1, r2), max(r1, r2));
+        if isKey(edge_count, key)
+            edge_count(key) = edge_count(key) + 1;
+        else
+            edge_count(key) = 1;
+        end
+    end
+
+    % Create adjacency matrix
+    adj_matrix = zeros(num_regions);
+    keys_list = keys(edge_count);
+    for i = 1:length(keys_list)
+        key = keys_list{i};
+        tokens = sscanf(key, '%d-%d');
+        r1 = tokens(1); r2 = tokens(2);
+        adj_matrix(r1, r2) = edge_count(key);
+        adj_matrix(r2, r1) = edge_count(key);
+    end
+
+    % Compute layout
+    region_graph = graph(adj_matrix);
+temp_fig = figure('Visible', 'off');
+temp_plot = plot(region_graph, 'Layout', 'force', 'Iterations', 100);
+x_raw = temp_plot.XData;
+y_raw = temp_plot.YData;
+close(temp_fig);
+
+
+    % Layout spacing and circle size
+    circle_width = 12;
+    circle_height = circle_width;
+    if (num_regions <= 10)
+        layout_scale = circle_width * 3.5;
+    elseif (num_regions <= 15  && num_regions > 10)
+        layout_scale = circle_width * 2.8;
+    else
+        layout_scale = circle_width * 2.4;
+    end
+    x_coords = x_raw * layout_scale;
+    y_coords = y_raw * layout_scale;
+
+    % Draw plot
+fig2 = figure(100); 
+set(fig2, 'Color', 'w');
+    hold on;
+    axis off;
+
+    bus_counts = zeros(num_regions, 1);
+for r = 1:num_regions
+    region_name = ['mpc_regionR', num2str(r)];
+    region_struct = data.(region_name);
+    bus_counts(r) = size(region_struct.bus, 1);
+
+    rectangle('Position', [x_coords(r)-circle_width/2, y_coords(r)-circle_height/2, ...
+               circle_width, circle_height], ...
+              'Curvature', [1,1], ...
+              'EdgeColor', 'b', ...               % Dashed outline
+              'LineWidth', 2.2);                   % Same thickness
+
+    text(x_coords(r), y_coords(r), ...
+         sprintf('R%d\n%d bus', r, bus_counts(r)), ...
+         'HorizontalAlignment', 'center', ...
+         'FontSize', fontsizew, 'FontWeight','bold');
+end
+
+
+    % Tie-lines
+    legend_handles = [];
+    legend_entries = {};
+    for i = 1:length(keys_list)
+        key = keys_list{i};
+        tokens = sscanf(key, '%d-%d');
+        r1 = tokens(1); r2 = tokens(2);
+
+        p1 = [x_coords(r1), y_coords(r1)];
+        p2 = [x_coords(r2), y_coords(r2)];
+        v = (p2 - p1) / norm(p2 - p1);
+        shrink = circle_width / 2 * 1.05;
+        new_p1 = p1 + shrink * v;
+        new_p2 = p2 - shrink * v;
+
+        h = plot([new_p1(1), new_p2(1)], [new_p1(2), new_p2(2)], 'k-', 'LineWidth', 1.6);
+        legend_handles(end+1) = h; %#ok<AGROW>
+        legend_entries{end+1} = sprintf('R%d to R%d: %d lines', ...
+                                        r1, r2, edge_count(key)); %#ok<AGROW>
+    end
+
+    % Display legends in two parts if too many entries
+    if length(legend_entries) > 50
+        % First legend (1–ceil(n/2))
+        split_idx = ceil(length(legend_entries)/2);
+        
+        % Create two separate axes for legends
+        ax1 = axes('Position', [0.8, 0.5, 0.15, 0.4], 'Visible', 'off');
+        legend(ax1, legend_handles(1:split_idx), legend_entries(1:split_idx), ...
+               'FontSize', fontsizew, 'FontWeight','bold', 'Location', 'northwest');
+
+        ax2 = axes('Position', [0.8, 0.05, 0.15, 0.4], 'Visible', 'off');
+        legend(ax2, legend_handles(split_idx+1:end), legend_entries(split_idx+1:end), ...
+               'FontSize', fontsizew, 'FontWeight','bold', 'Location', 'northwest');
+
+    else
+        % Standard single legend
+        lgd = legend(legend_handles, legend_entries, 'Location', 'northeastoutside');
+        set(lgd, 'FontSize', fontsizew, 'FontWeight','bold');
+    end
+
+
+    hold off;
+    set(gcf, 'Units', 'normalized', 'OuterPosition', [0 0 1 1]);
+    set(gca, 'FontSize', fontsizew);
+    drawnow;
+end
+
+
