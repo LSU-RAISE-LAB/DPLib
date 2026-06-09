@@ -341,6 +341,26 @@ caseName_Nregions_AC_rho.png
 
 ---
 
+## Python Interface
+
+DPLib cases can also be loaded in Python using the provided helper function. This allows users to access regional MATPOWER data structures, including bus, generator, branch, and cost matrices, for use in Python-based optimization, planning, voltage-stability analysis, or machine-learning workflows.
+
+Example:
+
+```python
+from load_dplib_case import load_dplib_case
+
+dplib_case = load_dplib_case("pglib_opf_case4917_goc_10regions.mat")
+
+print(dplib_case["filename"])
+print(dplib_case["num_regions"])
+
+region1 = dplib_case["regions"][1]
+bus = region1["bus"]
+gen = region1["gen"]
+branch = region1["branch"]
+gencost = region1["gencost"]
+
 ## Applications
 
 DPLib is designed as a distributed benchmark-data library. The generated multi-region datasets can be used as base data for many distributed power-system research problems.
