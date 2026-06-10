@@ -121,7 +121,7 @@ else
     % Make sure it's logical
     use_weighted = logical(use_weighted);
 end
-The_max_of_attempts = 50;
+The_max_of_attempts = 10;
 
 filename = ['''' case_input ''''];   
 filename = case_input;              
